@@ -14,201 +14,121 @@ function App() {
   const [input, setInput] = useState("");
   const [remoteStreams, setRemoteStreams] = useState({});
   const [activeSpeakers, setActiveSpeakers] = useState({});
+  const [handRaised, setHandRaised] = useState({});
+  const [showReactions, setShowReactions] = useState(false);
 
   const ws = useRef(null);
   const peers = useRef({});
   const localVideo = useRef(null);
   const localStream = useRef(null);
   const chatBox = useRef(null);
-  const typingTimeouts = useRef({});
-  const audioAnalyzers = useRef({});
-  const candidateBuffer = useRef({});
 
-  const ICE_SERVERS = [
-    { urls: "stun:stun.l.google.com:19302" },
-    {
-      urls: "turn:relay1.expressturn.com:3478",
-      username: "efree",
-      credential: "free",
-    },
-  ];
+  // GLOBAL CSS
+  useEffect(() => {
+    const css = document.createElement("style");
+    css.innerHTML = `
+      .reaction-emoji {
+        position: fixed;
+        bottom: 120px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 48px;
+        animation: floatUp 1.4s ease-out forwards;
+        pointer-events: none;
+        z-index: 999999;
+      }
+      @keyframes floatUp {
+        0% { transform: translate(-50%, 0); opacity: 1; }
+        100% { transform: translate(-50%, -150px); opacity: 0; }
+      }
+      .hand-badge {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: #ffeb3b;
+        padding: 4px 10px;
+        border-radius: 8px;
+        font-weight: bold;
+        color: #000;
+        font-size: 14px;
+      }
+      .video-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 12px;
+        padding: 20px;
+      }
+    `;
+    document.head.appendChild(css);
+  }, []);
 
   useEffect(() => {
     if (chatBox.current)
       chatBox.current.scrollTop = chatBox.current.scrollHeight;
   }, [messages]);
 
-  // 🔹 JOIN ROOM
-  const joinRoom = async () => {
+  // ===== Floating Reactions =====
+  const showFloatingEmoji = (emoji) => {
+    const el = document.createElement("div");
+    el.className = "reaction-emoji";
+    el.innerText = emoji;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 1400);
+  };
+
+  const sendReaction = (emoji) => {
+    showFloatingEmoji(emoji);
+    ws.current?.send(
+      JSON.stringify({ type: "reaction", emoji, from: username, room: ROOM_ID })
+    );
+  };
+
+  // ===== Raise Hand =====
+  const raiseHandToggle = () => {
+    const newState = !handRaised[username];
+    setHandRaised((prev) => ({ ...prev, [username]: newState }));
+
+    ws.current?.send(
+      JSON.stringify({
+        type: "raise",
+        raised: newState,
+        from: username,
+        room: ROOM_ID,
+      })
+    );
+  };
+
+  // ===== Typing =====
+  const handleTyping = (e) => {
+    setInput(e.target.value);
+
+    ws.current?.send(
+      JSON.stringify({ type: "typing", from: username, room: ROOM_ID })
+    );
+  };
+
+  // ===== Leave Call =====
+  const leaveCall = () => {
+    // notify others
     try {
-      console.log("Requesting camera & mic...");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480 },
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      localStream.current = stream;
-      if (localVideo.current) localVideo.current.srcObject = stream;
-
-      detectActiveSpeaker("self", stream);
-      connectSignaling();
-      setJoined(true);
-    } catch (err) {
-      console.error("Media error:", err);
-      alert("Please allow camera and microphone access.");
-    }
-  };
-
-  // 🔹 CONNECT SIGNALING
-  const connectSignaling = () => {
-    ws.current = new WebSocket(SIGNALING_SERVER);
-
-    ws.current.onopen = () => {
-      console.log("✅ Connected to signaling server");
-      ws.current.send(
-        JSON.stringify({ type: "join", room: ROOM_ID, username })
+      ws.current?.send(
+        JSON.stringify({
+          type: "leave",
+          from: username,
+          room: ROOM_ID,
+        })
       );
-    };
+    } catch {}
 
-    ws.current.onmessage = async (msg) => {
-      const data = JSON.parse(msg.data);
-      console.log("📩", data);
+    Object.values(peers.current).forEach((pc) => pc.close());
+    peers.current = {};
+    localStream.current?.getTracks().forEach((t) => t.stop());
+    ws.current?.close();
 
-      switch (data.type) {
-        case "ready":
-          if (localStream.current && !peers.current[data.from]) createOffer(data.from);
-          break;
-        case "offer":
-          await handleOffer(data.offer, data.from);
-          break;
-        case "answer":
-          await handleAnswer(data.answer, data.from);
-          break;
-        case "candidate":
-          handleCandidate(data.candidate, data.from);
-          break;
-        case "chat":
-          if (data.from !== username)
-            setMessages((prev) => [...prev, `${data.from}: ${data.message}`]);
-          break;
-        case "typing":
-          if (data.from !== username) showTyping(data.from);
-          break;
-        default:
-          break;
-      }
-    };
+    window.location.reload();
   };
 
-  // 🔹 SHOW TYPING
-  const showTyping = (user) => {
-    setTypingUsers((prev) => {
-      if (!prev.includes(user)) return [...prev, user];
-      return prev;
-    });
-    if (typingTimeouts.current[user])
-      clearTimeout(typingTimeouts.current[user]);
-    typingTimeouts.current[user] = setTimeout(() => {
-      setTypingUsers((prev) => prev.filter((u) => u !== user));
-    }, 1500);
-  };
-
-  // 🔹 WEBRTC CORE
-  const createPeer = (id) => {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    localStream.current?.getTracks().forEach((t) => pc.addTrack(t, localStream.current));
-
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate)
-        ws.current.send(
-          JSON.stringify({
-            type: "candidate",
-            to: id,
-            candidate: ev.candidate,
-            from: username,
-            room: ROOM_ID,
-          })
-        );
-    };
-
-    const remoteStream = new MediaStream();
-    pc.ontrack = (event) => {
-      event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track));
-      setRemoteStreams((prev) => ({ ...prev, [id]: remoteStream }));
-      detectActiveSpeaker(id, remoteStream);
-    };
-
-    if (candidateBuffer.current[id]) {
-      candidateBuffer.current[id].forEach((c) => {
-        pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
-      });
-      delete candidateBuffer.current[id];
-    }
-
-    peers.current[id] = pc;
-    return pc;
-  };
-
-  const createOffer = async (id) => {
-    const pc = createPeer(id);
-    const offer = await pc.createOffer({
-      offerToReceiveAudio: true,
-      offerToReceiveVideo: true,
-    });
-    await pc.setLocalDescription(offer);
-    ws.current.send(
-      JSON.stringify({ type: "offer", offer, to: id, from: username, room: ROOM_ID })
-    );
-  };
-
-  const handleOffer = async (offer, from) => {
-    const pc = peers.current[from] || createPeer(from);
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    ws.current.send(
-      JSON.stringify({ type: "answer", answer, to: from, from: username, room: ROOM_ID })
-    );
-  };
-
-  const handleAnswer = async (answer, from) => {
-    const pc = peers.current[from];
-    if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
-  };
-
-  const handleCandidate = (candidate, from) => {
-    const pc = peers.current[from];
-    if (pc)
-      pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(console.error);
-    else {
-      if (!candidateBuffer.current[from]) candidateBuffer.current[from] = [];
-      candidateBuffer.current[from].push(candidate);
-    }
-  };
-
-  // 🔹 DETECT ACTIVE SPEAKER
-  const detectActiveSpeaker = (id, stream) => {
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioCtx.createMediaStreamSource(stream);
-    const analyser = audioCtx.createAnalyser();
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    src.connect(analyser);
-    audioAnalyzers.current[id] = { audioCtx, analyser, dataArray };
-
-    const checkVolume = () => {
-      analyser.getByteFrequencyData(dataArray);
-      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-      setActiveSpeakers((prev) => ({ ...prev, [id]: avg > 20 }));
-      requestAnimationFrame(checkVolume);
-    };
-    checkVolume();
-  };
-
-  // 🔹 CONTROLS
+  // ===== Mute Mic =====
   const toggleMute = () => {
     const track = localStream.current?.getAudioTracks()[0];
     if (track) {
@@ -217,6 +137,7 @@ function App() {
     }
   };
 
+  // ===== Toggle Camera =====
   const toggleCamera = () => {
     const track = localStream.current?.getVideoTracks()[0];
     if (track) {
@@ -225,6 +146,7 @@ function App() {
     }
   };
 
+  // ===== Screen Share =====
   const shareScreen = async () => {
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
@@ -242,7 +164,7 @@ function App() {
         });
       }
 
-      if (localVideo.current) localVideo.current.srcObject = screenStream;
+      localVideo.current.srcObject = screenStream;
 
       screenStream.getVideoTracks()[0].onended = endScreenShare;
     } catch (e) {
@@ -252,39 +174,228 @@ function App() {
 
   const endScreenShare = () => {
     setScreenSharing(false);
-    const camTracks = localStream.current.getTracks();
 
+    const tracks = localStream.current.getTracks();
     for (const id in peers.current) {
       const senders = peers.current[id].getSenders();
-      camTracks.forEach((track) => {
+      tracks.forEach((track) => {
         const sender = senders.find((s) => s.track?.kind === track.kind);
         if (sender) sender.replaceTrack(track);
       });
     }
 
-    if (localVideo.current) localVideo.current.srcObject = localStream.current;
+    localVideo.current.srcObject = localStream.current;
   };
 
-  // 🔹 CHAT
-  const sendMessage = () => {
-    if (!input.trim()) return;
-    ws.current?.send(
-      JSON.stringify({ type: "chat", message: input, from: username, room: ROOM_ID })
+  // ===== JOIN ROOM =====
+  const joinRoom = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+
+      localStream.current = stream;
+
+      if (localVideo.current) localVideo.current.srcObject = stream;
+
+      detectActiveSpeaker("self", stream);
+      connectSignaling();
+      setJoined(true);
+    } catch (err) {
+      console.error("MEDIA ERROR:", err);
+      alert("Allow camera & mic to join");
+    }
+  };
+
+  // ===== SIGNALING =====
+  const connectSignaling = () => {
+    ws.current = new WebSocket(SIGNALING_SERVER);
+
+    ws.current.onopen = () => {
+      ws.current.send(
+        JSON.stringify({ type: "join", username, room: ROOM_ID })
+      );
+    };
+
+    ws.current.onmessage = async (msg) => {
+      const data = JSON.parse(msg.data);
+
+      switch (data.type) {
+        case "ready":
+          if (!peers.current[data.from]) createOffer(data.from);
+          break;
+
+        case "offer":
+          await handleOffer(data.offer, data.from);
+          break;
+
+        case "answer":
+          await handleAnswer(data.answer, data.from);
+          break;
+
+        case "candidate":
+          handleCandidate(data.candidate, data.from);
+          break;
+
+        case "reaction":
+          if (data.from !== username) showFloatingEmoji(data.emoji);
+          break;
+
+        case "raise":
+          setHandRaised((prev) => ({ ...prev, [data.from]: data.raised }));
+          break;
+
+        // ⭐⭐⭐ DYNAMIC TILE REMOVAL FIX ⭐⭐⭐
+        case "leave":
+          // remove tile from UI
+          setRemoteStreams((prev) => {
+            const copy = { ...prev };
+            delete copy[data.from];
+            return copy;
+          });
+
+          // close peer
+          if (peers.current[data.from]) {
+            peers.current[data.from].close();
+            delete peers.current[data.from];
+          }
+
+          // remove hand raise
+          setHandRaised((prev) => {
+            const copy = { ...prev };
+            delete copy[data.from];
+            return copy;
+          });
+
+          // remove speaker highlight
+          setActiveSpeakers((prev) => {
+            const copy = { ...prev };
+            delete copy[data.from];
+            return copy;
+          });
+
+          break;
+
+        default:
+          break;
+      }
+    };
+  };
+
+  // ===== WEBRTC CORE =====
+  const createPeer = (id) => {
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        {
+          urls: "turn:relay1.expressturn.com:3478",
+          username: "efree",
+          credential: "free",
+        },
+      ],
+    });
+
+    localStream.current.getTracks().forEach((t) =>
+      pc.addTrack(t, localStream.current)
     );
-    setMessages((prev) => [...prev, `You: ${input}`]);
-    setInput("");
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        ws.current.send(
+          JSON.stringify({
+            type: "candidate",
+            candidate: e.candidate,
+            from: username,
+            to: id,
+            room: ROOM_ID,
+          })
+        );
+      }
+    };
+
+    const remoteStream = new MediaStream();
+
+    pc.ontrack = (event) => {
+      event.streams[0]
+        .getTracks()
+        .forEach((t) => remoteStream.addTrack(t));
+
+      setRemoteStreams((prev) => ({
+        ...prev,
+        [id]: remoteStream,
+      }));
+
+      detectActiveSpeaker(id, remoteStream);
+    };
+
+    peers.current[id] = pc;
+    return pc;
   };
 
-  const handleTyping = (e) => {
-    setInput(e.target.value);
-    ws.current?.send(JSON.stringify({ type: "typing", from: username, room: ROOM_ID }));
+  const createOffer = async (id) => {
+    const pc = createPeer(id);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    ws.current.send(
+      JSON.stringify({
+        type: "offer",
+        offer,
+        to: id,
+        from: username,
+        room: ROOM_ID,
+      })
+    );
   };
 
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter") sendMessage();
+  const handleOffer = async (offer, from) => {
+    const pc = peers.current[from] || createPeer(from);
+    await pc.setRemoteDescription(offer);
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    ws.current.send(
+      JSON.stringify({
+        type: "answer",
+        answer,
+        to: from,
+        from: username,
+        room: ROOM_ID,
+      })
+    );
   };
 
-  // ---- UI ----
+  const handleAnswer = async (answer, from) => {
+    await peers.current[from]?.setRemoteDescription(answer);
+  };
+
+  const handleCandidate = (candidate, from) => {
+    peers.current[from]?.addIceCandidate(
+      new RTCIceCandidate(candidate)
+    );
+  };
+
+  // ===== ACTIVE SPEAKER =====
+  const detectActiveSpeaker = (id, stream) => {
+    const ctx = new AudioContext();
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    src.connect(analyser);
+
+    const loop = () => {
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      setActiveSpeakers((prev) => ({ ...prev, [id]: avg > 22 }));
+      requestAnimationFrame(loop);
+    };
+    loop();
+  };
+
+  // ===== JOIN SCREEN =====
   if (!joined) {
     return (
       <div
@@ -300,14 +411,17 @@ function App() {
           alignItems: "center",
         }}
       >
-        <h1 style={{ marginBottom: 20 }}>🎥 Join the Conference Room</h1>
+        <h1 style={{ marginBottom: 20 }}>
+          🎥 Join the Conference Room
+        </h1>
+
         <div
           style={{
             background: "white",
-            color: "#333",
             padding: 30,
-            borderRadius: 16,
             width: 320,
+            borderRadius: 16,
+            color: "#333",
             boxShadow: "0 8px 24px rgba(0,0,0,0.3)",
           }}
         >
@@ -317,23 +431,25 @@ function App() {
             placeholder="Enter your name"
             style={{
               width: "100%",
-              padding: "10px 14px",
+              padding: 10,
               border: "1px solid #ccc",
               borderRadius: 8,
               marginBottom: 20,
             }}
           />
+
           <button
             onClick={joinRoom}
             style={{
               width: "100%",
-              background: "linear-gradient(90deg,#00c6ff,#0072ff)",
+              background:
+                "linear-gradient(90deg,#00c6ff,#0072ff)",
               color: "white",
               border: "none",
-              padding: "10px 16px",
+              padding: 10,
               borderRadius: 8,
-              cursor: "pointer",
               fontWeight: 600,
+              cursor: "pointer",
             }}
           >
             Join Room
@@ -343,35 +459,34 @@ function App() {
     );
   }
 
+  // ===== MAIN LAYOUT =====
   return (
     <div
       style={{
         display: "flex",
         height: "100vh",
-        background: "#1a1a1a",
-        color: "white",
-        fontFamily: "Poppins, sans-serif",
+        background: "#111",
       }}
     >
-      {/* Video Grid */}
-      <div
-        style={{
-          flex: 3,
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
-          gap: "10px",
-          padding: "20px",
-        }}
-      >
+      <div className="video-grid" style={{ flex: 3 }}>
         <VideoTile
           id="self"
           name={`${username} (You)`}
           stream={localStream.current}
           videoRef={localVideo}
-          active={!!activeSpeakers["self"]}
+          handRaised={handRaised[username]}
+          active={activeSpeakers["self"]}
         />
+
         {Object.entries(remoteStreams).map(([id, stream]) => (
-          <VideoTile key={id} id={id} name={id} stream={stream} active={!!activeSpeakers[id]} />
+          <VideoTile
+            key={id}
+            id={id}
+            name={id}
+            stream={stream}
+            handRaised={handRaised[id]}
+            active={activeSpeakers[id]}
+          />
         ))}
       </div>
 
@@ -379,10 +494,21 @@ function App() {
         messages={messages}
         typingUsers={typingUsers}
         input={input}
+        setInput={setInput}
         handleTyping={handleTyping}
-        handleKeyDown={handleKeyDown}
-        sendMessage={sendMessage}
         chatBox={chatBox}
+        sendMessage={() => {
+          ws.current.send(
+            JSON.stringify({
+              type: "chat",
+              message: input,
+              from: username,
+              room: ROOM_ID,
+            })
+          );
+          setMessages((prev) => [...prev, `You: ${input}`]);
+          setInput("");
+        }}
       />
 
       <ControlBar
@@ -393,56 +519,69 @@ function App() {
         toggleCamera={toggleCamera}
         shareScreen={shareScreen}
         endScreenShare={endScreenShare}
+        sendReaction={sendReaction}
+        raiseHandToggle={raiseHandToggle}
+        leaveCall={leaveCall}
+        showReactions={showReactions}
+        setShowReactions={setShowReactions}
       />
     </div>
   );
 }
 
-// 🎥 VIDEO TILE COMPONENT
-const VideoTile = ({ id, name, stream, videoRef, active }) => (
+// ===== VIDEO TILE =====
+const VideoTile = ({ id, name, stream, videoRef, active, handRaised }) => (
   <div
     style={{
       position: "relative",
       borderRadius: 12,
       overflow: "hidden",
-      border: active ? "4px solid #00e676" : "2px solid #333",
-      boxShadow: active ? "0 0 20px #00e67680" : "0 2px 10px rgba(0,0,0,0.3)",
-      transition: "all 0.2s ease",
+      border: active
+        ? "4px solid #00e676"
+        : "2px solid #333",
+      transition: "0.2s",
     }}
   >
     <video
+      ref={(ref) => {
+        if (videoRef && id === "self") videoRef.current = ref;
+        if (ref && stream && ref.srcObject !== stream)
+          ref.srcObject = stream;
+      }}
       autoPlay
       playsInline
       muted={id === "self"}
-      ref={(ref) => {
-        if (videoRef && id === "self") videoRef.current = ref;
-        if (ref && stream && ref.srcObject !== stream) ref.srcObject = stream;
+      style={{
+        width: "100%",
+        height: "100%",
+        objectFit: "cover",
       }}
-      style={{ width: "100%", borderRadius: 12 }}
     />
+
     <div
       style={{
         position: "absolute",
         bottom: 8,
         left: 8,
         background: "#0008",
-        padding: "4px 8px",
+        padding: "4px 10px",
         borderRadius: 6,
-        fontSize: 13,
       }}
     >
       {name}
     </div>
+
+    {handRaised && <div className="hand-badge">✋</div>}
   </div>
 );
 
-// 💬 CHAT SIDEBAR
+// ===== CHAT SIDEBAR =====
 const ChatSidebar = ({
   messages,
   typingUsers,
   input,
+  setInput,
   handleTyping,
-  handleKeyDown,
   sendMessage,
   chatBox,
 }) => (
@@ -450,38 +589,42 @@ const ChatSidebar = ({
     style={{
       flex: 1,
       background: "#222",
+      color: "white",
       display: "flex",
       flexDirection: "column",
       borderLeft: "1px solid #333",
     }}
   >
-    <h3
-      style={{
-        padding: "15px",
-        borderBottom: "1px solid #333",
-        textAlign: "center",
-      }}
-    >
-      💬 Chat
+    <h3 style={{ padding: 10, textAlign: "center" }}>
+      Chat
     </h3>
-    <div ref={chatBox} style={{ flex: 1, overflowY: "auto", padding: 10 }}>
+
+    <div
+      ref={chatBox}
+      style={{ flex: 1, overflowY: "auto", padding: 10 }}
+    >
       {messages.map((m, i) => (
         <div key={i} style={{ marginBottom: 10 }}>
           {m}
         </div>
       ))}
+
       {typingUsers.map((u) => (
-        <div key={u} style={{ fontStyle: "italic", color: "gray", fontSize: 12 }}>
+        <div
+          key={u}
+          style={{ color: "gray", fontSize: 12 }}
+        >
           {u} is typing...
         </div>
       ))}
     </div>
+
     <div style={{ display: "flex", padding: 10 }}>
       <input
         value={input}
         onChange={handleTyping}
-        onKeyDown={handleKeyDown}
-        placeholder="Type and press Enter"
+        onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+        placeholder="Type a message…"
         style={{
           flex: 1,
           padding: 8,
@@ -490,13 +633,13 @@ const ChatSidebar = ({
           marginRight: 8,
         }}
       />
+
       <button
         onClick={sendMessage}
         style={{
           background: "#007bff",
-          color: "#fff",
-          border: "none",
-          padding: "8px 12px",
+          color: "white",
+          padding: "8px 14px",
           borderRadius: 6,
         }}
       >
@@ -506,7 +649,7 @@ const ChatSidebar = ({
   </div>
 );
 
-// 🎛️ CONTROL BAR
+// ===== CONTROL BAR =====
 const ControlBar = ({
   muted,
   cameraOn,
@@ -515,6 +658,11 @@ const ControlBar = ({
   toggleCamera,
   shareScreen,
   endScreenShare,
+  sendReaction,
+  raiseHandToggle,
+  leaveCall,
+  showReactions,
+  setShowReactions,
 }) => (
   <div
     style={{
@@ -523,39 +671,102 @@ const ControlBar = ({
       left: "50%",
       transform: "translateX(-50%)",
       background: "#222",
-      padding: "10px 20px",
-      borderRadius: 30,
+      padding: "14px 26px",
+      borderRadius: 40,
       display: "flex",
-      gap: 15,
-      boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+      gap: 14,
+      boxShadow: "0 5px 18px rgba(0,0,0,0.4)",
     }}
   >
-    <button onClick={toggleMute} style={controlBtnStyle}>
+    <button onClick={toggleMute} style={btn}>
       {muted ? "🔇" : "🎙️"}
     </button>
-    <button onClick={toggleCamera} style={controlBtnStyle}>
+
+    <button onClick={toggleCamera} style={btn}>
       {cameraOn ? "📷" : "🚫"}
     </button>
+
     {!screenSharing ? (
-      <button onClick={shareScreen} style={controlBtnStyle}>
+      <button onClick={shareScreen} style={btn}>
         🖥️
       </button>
     ) : (
-      <button onClick={endScreenShare} style={controlBtnStyle}>
+      <button onClick={endScreenShare} style={btn}>
         ❌
       </button>
     )}
+
+    {/* Reaction Menu */}
+    <div style={{ position: "relative" }}>
+      <button
+        onClick={() => setShowReactions((v) => !v)}
+        style={btn}
+      >
+        😊
+      </button>
+
+      {showReactions && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 55,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "#333",
+            padding: "8px 12px",
+            borderRadius: 12,
+            display: "flex",
+            gap: 10,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.45)",
+          }}
+        >
+          {["👍", "❤️", "😂", "🔥"].map((e) => (
+            <div
+              key={e}
+              onClick={() => {
+                sendReaction(e);
+                setShowReactions(false);
+              }}
+              style={{ fontSize: 26, cursor: "pointer" }}
+            >
+              {e}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+
+    <button onClick={raiseHandToggle} style={btn}>
+      ✋
+    </button>
+
+    <button
+      onClick={leaveCall}
+      style={{
+        ...btn,
+        background: "#ff4d4f",
+        padding: "0 18px",
+        width: "auto",
+        borderRadius: 20,
+        fontWeight: "bold",
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+      }}
+    >
+      🚪 Leave
+    </button>
   </div>
 );
 
-const controlBtnStyle = {
-  fontSize: 18,
+const btn = {
   background: "#333",
   color: "#fff",
   border: "none",
+  width: 46,
+  height: 46,
+  fontSize: 20,
   borderRadius: "50%",
-  width: 45,
-  height: 45,
   cursor: "pointer",
 };
 
